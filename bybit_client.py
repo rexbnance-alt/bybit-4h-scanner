@@ -1,6 +1,13 @@
 """
-Bybit V5 public API client.
-No auth needed for market data.
+Binance Futures USDT-M public API client.
+
+NOTE: File is still called bybit_client.py and class is BybitClient
+to keep diffs minimal — but underlying data source is now Binance Futures.
+Bybit's CloudFront WAF blocks GitHub Actions IPs (and most cloud IPs),
+so we use Binance Futures public API which has the same top-100 perps
+with virtually identical prices (arbitrage keeps spread < 0.05%).
+
+You can still TRADE on Bybit — only the analysis data source changed.
 """
 import logging
 import time
@@ -10,25 +17,32 @@ import requests
 
 log = logging.getLogger(__name__)
 
-BASE_URL = "https://api.bybit.com"
+BASE_URL = "https://fapi.binance.com"
 TIMEOUT = 15
+
+# Map Bybit-style numeric intervals to Binance string intervals so the
+# rest of the codebase (main.py, strategy.py) doesn't need changes.
+INTERVAL_MAP = {
+    "1": "1m", "3": "3m", "5": "5m", "15": "15m", "30": "30m",
+    "60": "1h", "120": "2h", "240": "4h", "360": "6h", "720": "12h",
+    "D": "1d", "W": "1w", "M": "1M",
+}
 
 
 class BybitClient:
+    """Public Binance Futures client (despite the legacy name)."""
+
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "bybit-4h-scanner/1.0"})
+        self.session.headers.update({"User-Agent": "binance-4h-scanner/1.0"})
 
-    def _get(self, path: str, params: dict) -> dict:
+    def _get(self, path: str, params: dict):
         url = f"{BASE_URL}{path}"
         for attempt in range(3):
             try:
                 r = self.session.get(url, params=params, timeout=TIMEOUT)
                 r.raise_for_status()
-                data = r.json()
-                if data.get("retCode") != 0:
-                    raise RuntimeError(f"Bybit error: {data.get('retMsg')}")
-                return data["result"]
+                return r.json()
             except Exception as e:
                 if attempt == 2:
                     raise
@@ -36,51 +50,46 @@ class BybitClient:
                 time.sleep(1)
 
     def get_top_pairs(self, n: int = 100) -> List[str]:
-        """Top N USDT-perp pairs by 24h turnover (USD volume)."""
-        result = self._get(
-            "/v5/market/tickers",
-            {"category": "linear"},
-        )
-        tickers = result.get("list", [])
+        """Top N USDT-margined perpetuals by 24h USD quote volume."""
+        data = self._get("/fapi/v1/ticker/24hr", {})
+        if not isinstance(data, list):
+            raise RuntimeError(f"Unexpected response shape: {type(data)}")
 
-        # Filter: USDT perpetuals only, exclude weird/dead pairs
         usdt_perps = [
-            t for t in tickers
+            t for t in data
             if t["symbol"].endswith("USDT")
-            and float(t.get("turnover24h", 0)) > 0
+            and "_" not in t["symbol"]
+            and float(t.get("quoteVolume", 0)) > 0
         ]
 
-        # Sort by USD turnover descending
-        usdt_perps.sort(key=lambda t: float(t["turnover24h"]), reverse=True)
-
+        usdt_perps.sort(key=lambda t: float(t["quoteVolume"]), reverse=True)
         return [t["symbol"] for t in usdt_perps[:n]]
 
     def get_klines(
         self, symbol: str, interval: str, limit: int = 200
     ) -> Optional[List[dict]]:
         """
-        Fetch klines. Interval values: 1, 3, 5, 15, 30, 60, 120, 240, 360, 720, D, W, M
+        Fetch klines from Binance Futures.
+        Accepts both Bybit-style ("240", "15") and Binance-style ("4h", "15m")
+        intervals via INTERVAL_MAP.
         Returns oldest-to-newest list of dicts:
-          {open_time, open, high, low, close, volume, turnover}
-        Bybit returns NEWEST first — we reverse so the latest is last.
+            {time, open, high, low, close, volume, turnover}
         """
-        result = self._get(
-            "/v5/market/kline",
+        binance_interval = INTERVAL_MAP.get(interval, interval)
+
+        data = self._get(
+            "/fapi/v1/klines",
             {
-                "category": "linear",
                 "symbol": symbol,
-                "interval": interval,
-                "limit": min(limit, 1000),
+                "interval": binance_interval,
+                "limit": min(limit, 1500),
             },
         )
-        raw = result.get("list", [])
-        if not raw:
+        if not data:
             return None
 
-        # Bybit kline format: [start, open, high, low, close, volume, turnover]
-        # API returns newest first; reverse for chronological order.
         candles = []
-        for k in reversed(raw):
+        for k in data:
             candles.append({
                 "time": int(k[0]),
                 "open": float(k[1]),
@@ -88,6 +97,6 @@ class BybitClient:
                 "low": float(k[3]),
                 "close": float(k[4]),
                 "volume": float(k[5]),
-                "turnover": float(k[6]),
+                "turnover": float(k[7]),
             })
         return candles
